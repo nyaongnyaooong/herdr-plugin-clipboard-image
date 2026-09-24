@@ -2,13 +2,21 @@ id = "clipboard-image"
 name = "Clipboard Image"
 version = "0.1.0"
 min_herdr_version = "0.9.0"
-description = "클립보드의 스크린샷을 파일로 저장하고 포커스된 창에 경로를 넣습니다."
-platforms = ["windows"]
+description = "Pastes clipboard images or text into the focused Herdr pane."
+platforms = ["linux", "windows"]
 
 [[actions]]
 id = "paste"
-title = "클립보드 이미지 붙여넣기"
+title = "Paste clipboard image"
 command = ["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", "scripts/paste-image.ps1"]
+platforms = ["windows"]
+
+[[actions]]
+id = "paste-linux"
+title = "Paste Linux clipboard image"
+command = ["python3", "scripts/paste-linux.py"]
+platforms = ["linux"]
 
 [[startup]]
 command = ["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/paste-watch.ps1"]
+platforms = ["windows"]

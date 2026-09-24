@@ -1,12 +1,14 @@
 # Clipboard Image
 
-Herdr plugin that saves a clipboard image into a temporary file and inserts its path into the focused pane. Text paste falls back to Herdr's focused-pane input.
+Pastes clipboard images into the focused Herdr pane. Windows uses a foreground-aware Ctrl+V watcher. Linux provides an explicit action that reads images from Wayland with `wl-paste` or from X11 with `xclip`.
 
-## Install from a local checkout
+## Install
 
 ```sh
 herdr plugin link /path/to/clipboard-image
 herdr server reload-config
 ```
 
-The Windows plugin includes a startup watcher that intercepts Ctrl+V while Herdr is focused. The action can also be invoked as `clipboard-image.paste`.
+On Windows, the startup watcher intercepts Ctrl+V only while Herdr is focused. Invoke `clipboard-image.paste` to run the action directly.
+
+On Linux desktops, invoke `clipboard-image.paste-linux`; it also accepts file URIs and text from the clipboard. A headless server cannot read a local desktop clipboard. When using `herdr --remote`, Herdr bridges the connecting client's image clipboard to the remote pane.
