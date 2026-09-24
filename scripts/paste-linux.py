@@ -75,6 +75,16 @@ def send_text(pane_id, text):
         raise RuntimeError(detail or "Could not send text to the focused pane")
 
 
+def notify(title, body):
+    run([HERDR, "notification", "show", title, "--body", body, "--sound", "none"])
+
+
+def remote_session():
+    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT"):
+        return True
+    return not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"))
+
+
 def main():
     pane_id = focused_pane()
     supplied = os.environ.get("HERDR_CLIPBOARD_IMAGE_PATH")
@@ -128,13 +138,21 @@ def main():
             return 0
 
     if tool is None:
-        print("No wl-paste or xclip clipboard is available on this server.", file=sys.stderr)
+        if remote_session():
+            message = (
+                "이 서버에는 데스크톱 클립보드가 없습니다. "
+                "원격 접속 중 이미지는 접속한 PC의 Herdr가 Ctrl+V로 전송합니다. "
+                "Windows에서 Herdr를 직접 연 경우에는 그 PC에 이 플러그인이 설치돼 있어야 Ctrl+V 감시가 동작합니다."
+            )
+        else:
+            message = "wl-paste 또는 xclip이 없어 클립보드를 읽지 못했습니다."
+        print(message, file=sys.stderr)
+        notify("클립보드 이미지", message)
         return 1
-    result = run([HERDR, "pane", "send-keys", pane_id, "ctrl+v"])
-    if result.returncode:
-        detail = result.stderr.decode("utf-8", "replace").strip()
-        raise RuntimeError(detail or "Could not forward Ctrl+V")
-    return 0
+    message = "클립보드에서 이미지, 파일, 텍스트를 찾지 못했습니다."
+    print(message, file=sys.stderr)
+    notify("클립보드 이미지", message)
+    return 1
 
 
 if __name__ == "__main__":
