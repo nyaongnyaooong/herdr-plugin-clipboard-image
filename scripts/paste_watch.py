@@ -11,8 +11,10 @@ import sys
 import threading
 import time
 import ctypes
+import shutil
 from ctypes import wintypes
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 from PIL import ImageGrab
 
@@ -65,6 +67,7 @@ hook_proc = None
 last_paste = 0.0
 paste_lock = threading.Lock()
 workspace_label = ""
+selected_machine = None
 
 
 def log(message):
@@ -100,11 +103,12 @@ def run_herdr(args, ignore_caller=False):
         log(f"herdr failed: {error}")
         return {}
     text = proc.stdout or ""
-    start = text.find("{")
-    if start < 0:
+    starts = [position for position in (text.find("{"), text.find("[")) if position >= 0]
+    if not starts:
         return {}
     try:
-        return json.loads(text[start:])
+        value, _ = json.JSONDecoder().raw_decode(text, min(starts))
+        return value
     except json.JSONDecodeError:
         return {}
 
@@ -169,30 +173,108 @@ def focused_pane():
     return next((item for item in siblings if item.get("focused")), siblings[0])
 
 
-def paste_image():
+def focused_machine_pane(machine):
+    machine_args = ["--machine", machine["id"]]
+    result = (run_herdr([*machine_args, "pane", "current"], ignore_caller=True).get("result") or {})
+    pane = result.get("pane") or {}
+    if pane.get("pane_id") and not is_status_pane(pane):
+        return pane
+    tab_id = pane.get("tab_id")
+    listed = (run_herdr([*machine_args, "pane", "list"], ignore_caller=True).get("result") or {}).get("panes") or []
+    siblings = [
+        item for item in listed
+        if item.get("tab_id") == tab_id and item.get("pane_id") and not is_status_pane(item)
+    ]
+    if not siblings:
+        return None
+    return next((item for item in siblings if item.get("focused")), siblings[0])
+
+
+def ssh_args(target):
+    """Turn a saved SSH target into OpenSSH arguments."""
+    if target.startswith("ssh://"):
+        parsed = urlparse(target)
+        if not parsed.hostname or parsed.password:
+            raise ValueError("unsupported SSH target URI")
+        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+        if parsed.username:
+            host = f"{parsed.username}@{host}"
+        args = ["ssh", "-T"]
+        if parsed.port:
+            args.extend(["-p", str(parsed.port)])
+        return [*args, host]
+    return ["ssh", "-T", target]
+
+
+def upload_remote_image(machine, local_path):
+    """Copy a staged image to the selected saved machine over its SSH target."""
+    target = machine.get("target")
+    if not target:
+        log("selected machine has no SSH target")
+        return None
+    ssh = shutil.which("ssh")
+    if not ssh:
+        log("ssh executable not found")
+        return None
+
+    name = os.path.basename(local_path)
+    if not name.startswith("clip-") or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for char in name):
+        log("refused unsafe clipboard image filename")
+        return None
+    remote_path = f"/tmp/herdr-clipboard-images/{name}"
+    remote_command = f"mkdir -p /tmp/herdr-clipboard-images && cat > {remote_path}"
+    try:
+        with open(local_path, "rb") as image_file:
+            proc = subprocess.run(
+                [ssh, *ssh_args(target)[1:], remote_command],
+                input=image_file.read(),
+                capture_output=True,
+                timeout=45,
+            )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        log(f"remote image transfer failed: {error}")
+        return None
+    if proc.returncode != 0:
+        detail = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+        log(f"remote image transfer failed exit={proc.returncode} {detail[:300]}")
+        return None
+    return remote_path
+
+
+def paste_image(machine=None):
     path = save_clipboard_image()
     if not path:
         log("clipboard has no image")
         return
-    pane = focused_pane()
+    pane = focused_machine_pane(machine) if machine else focused_pane()
     pane_id = (pane or {}).get("pane_id")
     if not pane_id:
         log("no focused pane")
         return
-    shown = path.replace("\\", "/")
+    shown = upload_remote_image(machine, path) if machine else path.replace("\\", "/")
+    if not shown:
+        return
     env = os.environ.copy()
     env.pop("HERDR_PANE_ID", None)
     env.pop("HERDR_TAB_ID", None)
-    proc = subprocess.run(
-        [herdr_bin(), "pane", "send-text", pane_id, f" {shown} "],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-    )
+    args = ["pane", "send-text", pane_id, f" {shown} "]
+    if machine:
+        args = ["--machine", machine["id"], *args]
+    try:
+        proc = subprocess.run(
+            [herdr_bin(), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+    except OSError as error:
+        log(f"herdr paste failed: {error}")
+        return
     title = pane.get("terminal_title") or ""
-    log(f"pasted {shown} -> {pane_id} tab={pane.get('tab_id')} title={title!r} exit {proc.returncode}")
+    host = machine.get("label") if machine else "local"
+    log(f"pasted {shown} -> {host}:{pane_id} tab={pane.get('tab_id')} title={title!r} exit {proc.returncode}")
 
 
 def foreground_window():
@@ -224,35 +306,45 @@ def label_loop():
 
 
 def refresh_workspace_label():
-    global workspace_label
+    global workspace_label, selected_machine
     result = run_herdr(["workspace", "list"])
     workspaces = (result.get("result") or {}).get("workspaces") or []
     chosen = next((item for item in workspaces if item.get("focused")), None)
     if not chosen and workspaces:
         chosen = workspaces[0]
     workspace_label = (chosen or {}).get("label") or ""
+    profiles = run_herdr(["machine", "list", "--json"])
+    if isinstance(profiles, dict):
+        profiles = (profiles.get("result") or {}).get("machines") or []
+    selected_machine = next(
+        (item for item in profiles if item.get("selected") and item.get("enabled")),
+        None,
+    )
 
 
-def foreground_is_herdr():
+def foreground_route():
     name, title = foreground_window()
     if name == "herdr.exe":
-        return True
+        return True, selected_machine
     if name not in {"windowsterminal.exe", "openconsole.exe"}:
-        return False
-    label = workspace_label
-    if not label:
-        return False
-    return title.endswith(f": {label}") or title.endswith(label)
+        return False, None
+    if selected_machine:
+        label = selected_machine.get("label") or ""
+        if label and (title == label or title.startswith(f"{label}: ")):
+            return True, selected_machine
+    if workspace_label and (title.endswith(f": {workspace_label}") or title.endswith(workspace_label)):
+        return True, None
+    return False, None
 
 
-def schedule_paste():
+def schedule_paste(machine=None):
     global last_paste
     now = time.monotonic()
     with paste_lock:
         if now - last_paste < 0.4:
             return
         last_paste = now
-    threading.Thread(target=paste_image, daemon=True).start()
+    threading.Thread(target=paste_image, args=(machine,), daemon=True).start()
 
 
 def hook_callback(code, wparam, lparam):
@@ -263,11 +355,12 @@ def hook_callback(code, wparam, lparam):
             alt = bool(user32.GetAsyncKeyState(VK_MENU) & 0x8000)
             if info.vkCode == VK_V and ctrl and not alt and not (info.flags & LLKHF_UP):
                 name, title = foreground_window()
-                matched = foreground_is_herdr()
+                matched, machine = foreground_route()
                 image = clipboard_has_image()
-                log(f"ctrl+v app={name} title={title!r} match={matched} image={image}")
+                target = (machine or {}).get("label", "local") if matched else "none"
+                log(f"ctrl+v app={name} title={title!r} match={matched} target={target} image={image}")
                 if matched and image:
-                    schedule_paste()
+                    schedule_paste(machine)
                     return 1
     except Exception as error:
         log(f"hook error: {error}")

@@ -11,4 +11,4 @@ herdr server reload-config
 
 On Windows, the startup watcher intercepts Ctrl+V only while Herdr is focused. Invoke `clipboard-image.paste` to run the action directly.
 
-On Linux desktops, invoke `clipboard-image.paste-linux`; it also accepts file URIs and text from the clipboard. A headless server cannot read the clipboard of the computer you are connecting from. Image paste during `herdr --remote` or a saved SSH machine is handled by the local Herdr client (`keys.remote_image_paste`, default `ctrl+v`), not by this plugin. The Windows Ctrl+V watcher runs only when the plugin is installed on that Windows machine.
+On Linux desktops, invoke `clipboard-image.paste-linux`; it also accepts file URIs and text from the clipboard. A headless server cannot read the clipboard of the computer you are connecting from. Herdr bridges image paste during `herdr --remote`. For a saved SSH machine, this plugin's Windows watcher detects the selected machine, transfers the clipboard image over that machine's saved SSH target, then inserts the remote temporary-file path into its focused pane. The watcher must be installed on the Windows client.
