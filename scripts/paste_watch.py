@@ -12,6 +12,8 @@ import threading
 import time
 import ctypes
 import shutil
+import posixpath
+import shlex
 from ctypes import wintypes
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
@@ -33,40 +35,9 @@ CF_HDROP = 15
 CF_DIBV5 = 17
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 LLKHF_UP = 0x80
-KEYEVENTF_KEYUP = 0x0002
-KEYEVENTF_UNICODE = 0x0004
 
 LRESULT = ctypes.c_ssize_t
 HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
-
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [
-        ("wVk", wintypes.WORD),
-        ("wScan", wintypes.WORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_size_t),
-    ]
-
-
-class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [
-        ("dx", wintypes.LONG),
-        ("dy", wintypes.LONG),
-        ("mouseData", wintypes.DWORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_size_t),
-    ]
-
-
-class INPUTUNION(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT)]
-
-
-class INPUT(ctypes.Structure):
-    _fields_ = [("type", wintypes.DWORD), ("union", INPUTUNION)]
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -87,8 +58,6 @@ user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wint
 user32.GetForegroundWindow.restype = wintypes.HWND
 user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
-user32.SendInput.restype = wintypes.UINT
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.OpenProcess.restype = wintypes.HANDLE
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
@@ -167,6 +136,25 @@ def stage_dir():
     return path
 
 
+def stage_workspace_image(cwd, source_path):
+    """Copy an image into the active workspace for Cursor's @path context."""
+    folder = os.path.join(cwd, "herdr-clipboard-images")
+    os.makedirs(folder, exist_ok=True)
+    cutoff = datetime.now().timestamp() - 2 * 24 * 60 * 60
+    for name in os.listdir(folder):
+        if not name.startswith("clip-"):
+            continue
+        file_path = os.path.join(folder, name)
+        try:
+            if os.path.isfile(file_path) and os.path.getmtime(file_path) < cutoff:
+                os.remove(file_path)
+        except OSError:
+            pass
+    target_path = os.path.join(folder, os.path.basename(source_path))
+    shutil.copy2(source_path, target_path)
+    return target_path
+
+
 def clipboard_has_image():
     return any(user32.IsClipboardFormatAvailable(fmt) for fmt in (CF_DIB, CF_DIBV5, CF_BITMAP))
 
@@ -229,7 +217,7 @@ def ssh_args(target):
     return ["ssh", "-T", target]
 
 
-def upload_remote_image(machine, local_path):
+def upload_remote_image(machine, local_path, pane=None):
     """Copy a staged image to the selected saved machine over its SSH target."""
     target = machine.get("target")
     if not target:
@@ -244,8 +232,22 @@ def upload_remote_image(machine, local_path):
     if not name.startswith("clip-") or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for char in name):
         log("refused unsafe clipboard image filename")
         return None
-    remote_path = f"/tmp/herdr-clipboard-images/{name}"
-    remote_command = f"mkdir -p /tmp/herdr-clipboard-images && cat > {remote_path}"
+    agent = ((pane or {}).get("agent") or "").lower()
+    pane_cwd = (pane or {}).get("foreground_cwd") or (pane or {}).get("cwd")
+    if agent == "cursor" and pane_cwd and pane_cwd.startswith("/"):
+        # Cursor CLI's documented workaround is an @path file reference. Keep
+        # the temporary image under its workspace so the CLI can resolve it.
+        remote_dir = posixpath.join(pane_cwd, "herdr-clipboard-images")
+    else:
+        remote_dir = "/tmp/herdr-clipboard-images"
+    remote_path = posixpath.join(remote_dir, name)
+    quoted_dir = shlex.quote(remote_dir)
+    quoted_path = shlex.quote(remote_path)
+    remote_command = (
+        f"mkdir -p -- {quoted_dir} && "
+        f"(find {quoted_dir} -maxdepth 1 -type f -name 'clip-*' -mmin +2880 -delete "
+        f"2>/dev/null || true) && cat > {quoted_path}"
+    )
     try:
         with open(local_path, "rb") as image_file:
             proc = subprocess.run(
@@ -271,7 +273,7 @@ def remove_remote_image(machine, remote_path):
         return
     try:
         subprocess.run(
-            [ssh, *ssh_args(target)[1:], f"rm -f -- {remote_path}"],
+            [ssh, *ssh_args(target)[1:], f"rm -f -- {shlex.quote(remote_path)}"],
             capture_output=True,
             timeout=15,
         )
@@ -279,19 +281,60 @@ def remove_remote_image(machine, remote_path):
         pass
 
 
-def send_unicode_text(text):
-    """Type ASCII text into the currently focused Windows Terminal client."""
-    events = []
-    for char in text:
-        codepoint = ord(char)
-        if codepoint > 0xFFFF:
-            raise ValueError("non-BMP text is not supported by the terminal path injector")
-        events.append(INPUT(type=1, union=INPUTUNION(ki=KEYBDINPUT(0, codepoint, KEYEVENTF_UNICODE, 0, 0))))
-        events.append(INPUT(type=1, union=INPUTUNION(ki=KEYBDINPUT(0, codepoint, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0))))
-    if not events:
-        return True
-    batch = (INPUT * len(events))(*events)
-    return user32.SendInput(len(events), batch, ctypes.sizeof(INPUT)) == len(events)
+def remote_focused_pane(machine):
+    """Return the focused non-status pane on a saved remote Herdr machine."""
+    machine_id = machine.get("id") or machine.get("label")
+    if not machine_id:
+        log("selected machine has no Herdr machine id")
+        return None
+
+    current = run_herdr(["--machine", machine_id, "pane", "current"], ignore_caller=True)
+    pane = ((current.get("result") or {}).get("pane") or {}) if isinstance(current, dict) else {}
+    if pane.get("pane_id") and not is_status_pane(pane):
+        return pane
+
+    tab_id = pane.get("tab_id")
+    listed = run_herdr(["--machine", machine_id, "pane", "list"], ignore_caller=True)
+    panes = ((listed.get("result") or {}).get("panes") or []) if isinstance(listed, dict) else []
+    siblings = [
+        item for item in panes
+        if item.get("tab_id") == tab_id and item.get("pane_id") and not is_status_pane(item)
+    ]
+    if not siblings:
+        log(f"no focused remote pane machine={machine.get('label')}")
+        return None
+    return next((item for item in siblings if item.get("focused")), siblings[0])
+
+
+def paste_remote_path(machine, pane_id, remote_path):
+    """Send a bracketed paste to the remote TUI so image paths are recognized."""
+    machine_id = machine.get("id") or machine.get("label")
+    if not machine_id or not pane_id:
+        return False
+    # A real terminal paste is bracketed. In particular, Codex turns pasted
+    # local image paths into image attachments; typing the same path leaves text.
+    pasted = f"\x1b[200~ {remote_path} \x1b[201~"
+    env = os.environ.copy()
+    env.pop("HERDR_PANE_ID", None)
+    env.pop("HERDR_TAB_ID", None)
+    try:
+        proc = subprocess.run(
+            [herdr_bin(), "--machine", machine_id, "pane", "send-text", pane_id, pasted],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        log(f"remote path paste failed: {error}")
+        return False
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        log(f"remote path paste failed exit={proc.returncode} {detail[:300]}")
+        return False
+    return True
 
 
 def still_in_remote_window(machine, expected_hwnd, expected_title):
@@ -321,23 +364,33 @@ def paste_image(machine=None, expected_hwnd=None, expected_title=""):
         log("clipboard has no image")
         return
     if machine:
-        remote_path = upload_remote_image(machine, path)
-        if not remote_path:
-            return
         if not wait_for_control_release() or not still_in_remote_window(machine, expected_hwnd, expected_title):
-            remove_remote_image(machine, remote_path)
             log(f"remote paste cancelled because the focused window changed machine={machine.get('label')}")
             return
-        try:
-            sent = send_unicode_text(f" {remote_path} ")
-        except (OSError, ValueError) as error:
-            sent = False
-            log(f"remote path input failed: {error}")
-        if not sent:
-            remove_remote_image(machine, remote_path)
-            log(f"remote path input failed machine={machine.get('label')}")
+        pane = remote_focused_pane(machine)
+        if not pane:
             return
-        log(f"pasted {remote_path} through focused window machine={machine.get('label')} title={expected_title!r}")
+        uploaded_path = upload_remote_image(machine, path, pane)
+        if not uploaded_path:
+            return
+        if not wait_for_control_release() or not still_in_remote_window(machine, expected_hwnd, expected_title):
+            remove_remote_image(machine, uploaded_path)
+            log(f"remote paste cancelled because the focused window changed machine={machine.get('label')}")
+            return
+        prompt_reference = uploaded_path
+        agent = (pane.get("agent") or "").lower()
+        if agent == "cursor":
+            pane_cwd = pane.get("foreground_cwd") or pane.get("cwd") or ""
+            reference = posixpath.relpath(uploaded_path, pane_cwd) if pane_cwd else uploaded_path
+            prompt_reference = f"@{reference}"
+        if not paste_remote_path(machine, pane.get("pane_id"), prompt_reference):
+            remove_remote_image(machine, uploaded_path)
+            log(f"remote path paste failed machine={machine.get('label')}")
+            return
+        log(
+            f"pasted {prompt_reference} -> remote:{pane.get('pane_id')} "
+            f"machine={machine.get('label')} title={expected_title!r}"
+        )
         return
 
     pane = focused_pane()
@@ -346,6 +399,15 @@ def paste_image(machine=None, expected_hwnd=None, expected_title=""):
         log("no focused pane")
         return
     shown = path.replace("\\", "/")
+    if (pane.get("agent") or "").lower() == "cursor":
+        pane_cwd = pane.get("foreground_cwd") or pane.get("cwd")
+        if pane_cwd:
+            try:
+                workspace_image = stage_workspace_image(pane_cwd, path)
+                shown = "@" + os.path.relpath(workspace_image, pane_cwd).replace("\\", "/")
+            except OSError as error:
+                log(f"could not stage image for Cursor CLI: {error}")
+                return
     env = os.environ.copy()
     env.pop("HERDR_PANE_ID", None)
     env.pop("HERDR_TAB_ID", None)
