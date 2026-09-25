@@ -33,9 +33,40 @@ CF_HDROP = 15
 CF_DIBV5 = 17
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 LLKHF_UP = 0x80
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
 
 LRESULT = ctypes.c_ssize_t
 HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("union", INPUTUNION)]
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -53,6 +84,14 @@ user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE,
 user32.CallNextHookEx.restype = LRESULT
 user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
 user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+user32.SendInput.restype = wintypes.UINT
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.QueryFullProcessImageNameW.argtypes = [
     wintypes.HANDLE,
     wintypes.DWORD,
@@ -65,6 +104,7 @@ LOG_PATH = os.path.join(STATE_DIR, "paste.log")
 hook_handle = None
 hook_proc = None
 last_paste = 0.0
+paste_in_progress = False
 paste_lock = threading.Lock()
 workspace_label = ""
 selected_machine = None
@@ -173,23 +213,6 @@ def focused_pane():
     return next((item for item in siblings if item.get("focused")), siblings[0])
 
 
-def focused_machine_pane(machine):
-    machine_args = ["--machine", machine["id"]]
-    result = (run_herdr([*machine_args, "pane", "current"], ignore_caller=True).get("result") or {})
-    pane = result.get("pane") or {}
-    if pane.get("pane_id") and not is_status_pane(pane):
-        return pane
-    tab_id = pane.get("tab_id")
-    listed = (run_herdr([*machine_args, "pane", "list"], ignore_caller=True).get("result") or {}).get("panes") or []
-    siblings = [
-        item for item in listed
-        if item.get("tab_id") == tab_id and item.get("pane_id") and not is_status_pane(item)
-    ]
-    if not siblings:
-        return None
-    return next((item for item in siblings if item.get("focused")), siblings[0])
-
-
 def ssh_args(target):
     """Turn a saved SSH target into OpenSSH arguments."""
     if target.startswith("ssh://"):
@@ -241,25 +264,92 @@ def upload_remote_image(machine, local_path):
     return remote_path
 
 
-def paste_image(machine=None):
+def remove_remote_image(machine, remote_path):
+    target = machine.get("target")
+    ssh = shutil.which("ssh")
+    if not target or not ssh:
+        return
+    try:
+        subprocess.run(
+            [ssh, *ssh_args(target)[1:], f"rm -f -- {remote_path}"],
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+
+
+def send_unicode_text(text):
+    """Type ASCII text into the currently focused Windows Terminal client."""
+    events = []
+    for char in text:
+        codepoint = ord(char)
+        if codepoint > 0xFFFF:
+            raise ValueError("non-BMP text is not supported by the terminal path injector")
+        events.append(INPUT(type=1, union=INPUTUNION(ki=KEYBDINPUT(0, codepoint, KEYEVENTF_UNICODE, 0, 0))))
+        events.append(INPUT(type=1, union=INPUTUNION(ki=KEYBDINPUT(0, codepoint, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0))))
+    if not events:
+        return True
+    batch = (INPUT * len(events))(*events)
+    return user32.SendInput(len(events), batch, ctypes.sizeof(INPUT)) == len(events)
+
+
+def still_in_remote_window(machine, expected_hwnd, expected_title):
+    hwnd, name, title = foreground_window()
+    matched, current_machine = foreground_route(name, title)
+    return (
+        hwnd == expected_hwnd
+        and title == expected_title
+        and matched
+        and current_machine is not None
+        and current_machine.get("id") == machine.get("id")
+    )
+
+
+def wait_for_control_release(timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while user32.GetAsyncKeyState(VK_CONTROL) & 0x8000:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def paste_image(machine=None, expected_hwnd=None, expected_title=""):
     path = save_clipboard_image()
     if not path:
         log("clipboard has no image")
         return
-    pane = focused_machine_pane(machine) if machine else focused_pane()
+    if machine:
+        remote_path = upload_remote_image(machine, path)
+        if not remote_path:
+            return
+        if not wait_for_control_release() or not still_in_remote_window(machine, expected_hwnd, expected_title):
+            remove_remote_image(machine, remote_path)
+            log(f"remote paste cancelled because the focused window changed machine={machine.get('label')}")
+            return
+        try:
+            sent = send_unicode_text(f" {remote_path} ")
+        except (OSError, ValueError) as error:
+            sent = False
+            log(f"remote path input failed: {error}")
+        if not sent:
+            remove_remote_image(machine, remote_path)
+            log(f"remote path input failed machine={machine.get('label')}")
+            return
+        log(f"pasted {remote_path} through focused window machine={machine.get('label')} title={expected_title!r}")
+        return
+
+    pane = focused_pane()
     pane_id = (pane or {}).get("pane_id")
     if not pane_id:
         log("no focused pane")
         return
-    shown = upload_remote_image(machine, path) if machine else path.replace("\\", "/")
-    if not shown:
-        return
+    shown = path.replace("\\", "/")
     env = os.environ.copy()
     env.pop("HERDR_PANE_ID", None)
     env.pop("HERDR_TAB_ID", None)
     args = ["pane", "send-text", pane_id, f" {shown} "]
-    if machine:
-        args = ["--machine", machine["id"], *args]
     try:
         proc = subprocess.run(
             [herdr_bin(), *args],
@@ -273,8 +363,7 @@ def paste_image(machine=None):
         log(f"herdr paste failed: {error}")
         return
     title = pane.get("terminal_title") or ""
-    host = machine.get("label") if machine else "local"
-    log(f"pasted {shown} -> {host}:{pane_id} tab={pane.get('tab_id')} title={title!r} exit {proc.returncode}")
+    log(f"pasted {shown} -> local:{pane_id} tab={pane.get('tab_id')} title={title!r} exit {proc.returncode}")
 
 
 def foreground_window():
@@ -293,7 +382,7 @@ def foreground_window():
                 name = os.path.basename(buffer.value).lower()
         finally:
             kernel32.CloseHandle(handle)
-    return name, title.value
+    return hwnd, name, title.value
 
 
 def label_loop():
@@ -322,8 +411,9 @@ def refresh_workspace_label():
     )
 
 
-def foreground_route():
-    name, title = foreground_window()
+def foreground_route(name=None, title=None):
+    if name is None or title is None:
+        _, name, title = foreground_window()
     if name == "herdr.exe":
         return True, selected_machine
     if name not in {"windowsterminal.exe", "openconsole.exe"}:
@@ -337,14 +427,24 @@ def foreground_route():
     return False, None
 
 
-def schedule_paste(machine=None):
-    global last_paste
+def schedule_paste(machine=None, expected_hwnd=None, expected_title=""):
+    global last_paste, paste_in_progress
     now = time.monotonic()
     with paste_lock:
-        if now - last_paste < 0.4:
+        if paste_in_progress or now - last_paste < 0.4:
             return
         last_paste = now
-    threading.Thread(target=paste_image, args=(machine,), daemon=True).start()
+        paste_in_progress = True
+
+    def worker():
+        global paste_in_progress
+        try:
+            paste_image(machine, expected_hwnd, expected_title)
+        finally:
+            with paste_lock:
+                paste_in_progress = False
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def hook_callback(code, wparam, lparam):
@@ -354,13 +454,13 @@ def hook_callback(code, wparam, lparam):
             ctrl = bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
             alt = bool(user32.GetAsyncKeyState(VK_MENU) & 0x8000)
             if info.vkCode == VK_V and ctrl and not alt and not (info.flags & LLKHF_UP):
-                name, title = foreground_window()
-                matched, machine = foreground_route()
+                hwnd, name, title = foreground_window()
+                matched, machine = foreground_route(name, title)
                 image = clipboard_has_image()
                 target = (machine or {}).get("label", "local") if matched else "none"
                 log(f"ctrl+v app={name} title={title!r} match={matched} target={target} image={image}")
                 if matched and image:
-                    schedule_paste(machine)
+                    schedule_paste(machine, hwnd, title)
                     return 1
     except Exception as error:
         log(f"hook error: {error}")
