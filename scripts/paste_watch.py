@@ -385,46 +385,28 @@ def paste_remote_path(machine, pane_id, remote_path):
     return True
 
 
-def still_in_remote_window(machine, expected_hwnd, expected_title):
-    hwnd, name, title = foreground_window()
-    matched, current_machine = foreground_route(name, title)
-    return (
-        hwnd == expected_hwnd
-        and title == expected_title
-        and matched
-        and current_machine is not None
-        and current_machine.get("id") == machine.get("id")
-    )
-
-
-def wait_for_control_release(timeout=1.0):
-    deadline = time.monotonic() + timeout
-    while user32.GetAsyncKeyState(VK_CONTROL) & 0x8000:
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.01)
-    return True
-
-
-def paste_image(machine=None, expected_hwnd=None, expected_title=""):
+def paste_image(machine=None):
     path = save_clipboard_image()
     if not path:
         log("clipboard has no image")
         return
     if machine:
-        if not wait_for_control_release() or not still_in_remote_window(machine, expected_hwnd, expected_title):
-            log(f"remote paste cancelled because the focused window changed machine={machine.get('label')}")
-            return
+        # The machine target is captured from the foreground window at the
+        # Ctrl+V event. Keep using that target even if the foreground changes
+        # while SSH uploads the image; delivery uses Herdr's pane API.
         pane = remote_focused_pane(machine)
         if not pane:
+            delete_local_image(path)
             return
+        log(
+            f"remote paste target pane={pane.get('pane_id')} agent={pane.get('agent')} "
+            f"title={pane.get('terminal_title')!r} machine={machine.get('label')}"
+        )
         uploaded_path = upload_remote_image(machine, path, pane)
         if not uploaded_path:
+            delete_local_image(path)
             return
-        if not wait_for_control_release() or not still_in_remote_window(machine, expected_hwnd, expected_title):
-            remove_remote_image(machine, uploaded_path)
-            log(f"remote paste cancelled because the focused window changed machine={machine.get('label')}")
-            return
+        delete_local_image(path)
         prompt_reference = uploaded_path
         agent = (pane.get("agent") or "").lower()
         if agent == "cursor":
@@ -437,7 +419,7 @@ def paste_image(machine=None, expected_hwnd=None, expected_title=""):
             return
         log(
             f"pasted {prompt_reference} -> remote:{pane.get('pane_id')} "
-            f"machine={machine.get('label')} title={expected_title!r}"
+            f"machine={machine.get('label')} title={pane.get('terminal_title')!r}"
         )
         if agent in {"codex", "cursor"}:
             schedule_image_cleanup(
@@ -445,7 +427,6 @@ def paste_image(machine=None, expected_hwnd=None, expected_title=""):
                 pane.get("pane_id"),
                 uploaded_path,
                 pane.get("agent_status"),
-                local_path=path,
             )
         return
 
@@ -560,7 +541,7 @@ def foreground_route(name=None, title=None):
     return False, None
 
 
-def schedule_paste(machine=None, expected_hwnd=None, expected_title=""):
+def schedule_paste(machine=None):
     global last_paste, paste_in_progress
     now = time.monotonic()
     with paste_lock:
@@ -572,7 +553,7 @@ def schedule_paste(machine=None, expected_hwnd=None, expected_title=""):
     def worker():
         global paste_in_progress
         try:
-            paste_image(machine, expected_hwnd, expected_title)
+            paste_image(machine)
         finally:
             with paste_lock:
                 paste_in_progress = False
@@ -587,13 +568,13 @@ def hook_callback(code, wparam, lparam):
             ctrl = bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
             alt = bool(user32.GetAsyncKeyState(VK_MENU) & 0x8000)
             if info.vkCode == VK_V and ctrl and not alt and not (info.flags & LLKHF_UP):
-                hwnd, name, title = foreground_window()
+                _, name, title = foreground_window()
                 matched, machine = foreground_route(name, title)
                 image = clipboard_has_image()
                 target = (machine or {}).get("label", "local") if matched else "none"
                 log(f"ctrl+v app={name} title={title!r} match={matched} target={target} image={image}")
                 if matched and image:
-                    schedule_paste(machine, hwnd, title)
+                    schedule_paste(machine)
                     return 1
     except Exception as error:
         log(f"hook error: {error}")
