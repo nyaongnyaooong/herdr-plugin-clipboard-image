@@ -77,6 +77,7 @@ paste_in_progress = False
 paste_lock = threading.Lock()
 workspace_label = ""
 selected_machine = None
+saved_machines = []
 
 
 def log(message):
@@ -306,6 +307,53 @@ def remote_focused_pane(machine):
     return next((item for item in siblings if item.get("focused")), siblings[0])
 
 
+def pane_agent_status(machine, pane_id):
+    args = ["pane", "list"]
+    if machine:
+        machine_id = machine.get("id") or machine.get("label")
+        if not machine_id:
+            return None
+        args = ["--machine", machine_id, *args]
+    result = run_herdr(args, ignore_caller=True)
+    panes = ((result.get("result") or {}).get("panes") or []) if isinstance(result, dict) else []
+    pane = next((item for item in panes if item.get("pane_id") == pane_id), None)
+    return (pane or {}).get("agent_status")
+
+
+def delete_local_image(path):
+    if not path or not os.path.basename(path).startswith("clip-"):
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def schedule_image_cleanup(machine, pane_id, image_path, initial_status, local_path=None):
+    """Remove staged image files shortly after the CLI starts the submitted turn."""
+    def worker():
+        saw_idle = initial_status != "working"
+        deadline = time.monotonic() + 5 * 60
+        interval = 1.5 if machine else 0.5
+        while time.monotonic() < deadline:
+            status = pane_agent_status(machine, pane_id)
+            if status and status != "working":
+                saw_idle = True
+            elif status == "working" and saw_idle:
+                # Let the CLI finish reading the @path or attached image data.
+                time.sleep(10)
+                if machine:
+                    remove_remote_image(machine, image_path)
+                else:
+                    delete_local_image(image_path)
+                delete_local_image(local_path)
+                log(f"cleaned submitted clipboard image pane={pane_id} machine={(machine or {}).get('label', 'local')}")
+                return
+            time.sleep(interval)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def paste_remote_path(machine, pane_id, remote_path):
     """Send a bracketed paste to the remote TUI so image paths are recognized."""
     machine_id = machine.get("id") or machine.get("label")
@@ -391,6 +439,14 @@ def paste_image(machine=None, expected_hwnd=None, expected_title=""):
             f"pasted {prompt_reference} -> remote:{pane.get('pane_id')} "
             f"machine={machine.get('label')} title={expected_title!r}"
         )
+        if agent in {"codex", "cursor"}:
+            schedule_image_cleanup(
+                machine,
+                pane.get("pane_id"),
+                uploaded_path,
+                pane.get("agent_status"),
+                local_path=path,
+            )
         return
 
     pane = focused_pane()
@@ -426,6 +482,15 @@ def paste_image(machine=None, expected_hwnd=None, expected_title=""):
         return
     title = pane.get("terminal_title") or ""
     log(f"pasted {shown} -> local:{pane_id} tab={pane.get('tab_id')} title={title!r} exit {proc.returncode}")
+    if proc.returncode == 0 and (pane.get("agent") or "").lower() in {"codex", "cursor"}:
+        image_path = workspace_image if (pane.get("agent") or "").lower() == "cursor" and pane_cwd else path
+        schedule_image_cleanup(
+            None,
+            pane_id,
+            image_path,
+            pane.get("agent_status"),
+            local_path=path if image_path != path else None,
+        )
 
 
 def foreground_window():
@@ -457,7 +522,7 @@ def label_loop():
 
 
 def refresh_workspace_label():
-    global workspace_label, selected_machine
+    global workspace_label, selected_machine, saved_machines
     result = run_herdr(["workspace", "list"])
     workspaces = (result.get("result") or {}).get("workspaces") or []
     chosen = next((item for item in workspaces if item.get("focused")), None)
@@ -467,8 +532,9 @@ def refresh_workspace_label():
     profiles = run_herdr(["machine", "list", "--json"])
     if isinstance(profiles, dict):
         profiles = (profiles.get("result") or {}).get("machines") or []
+    saved_machines = [item for item in profiles if item.get("enabled")]
     selected_machine = next(
-        (item for item in profiles if item.get("selected") and item.get("enabled")),
+        (item for item in saved_machines if item.get("selected")),
         None,
     )
 
@@ -476,6 +542,11 @@ def refresh_workspace_label():
 def foreground_route(name=None, title=None):
     if name is None or title is None:
         _, name, title = foreground_window()
+    if name in {"herdr.exe", "windowsterminal.exe", "openconsole.exe"}:
+        for machine in saved_machines:
+            label = machine.get("label") or ""
+            if label and (title == label or title.startswith(f"{label}: ")):
+                return True, machine
     if name == "herdr.exe":
         return True, selected_machine
     if name not in {"windowsterminal.exe", "openconsole.exe"}:
