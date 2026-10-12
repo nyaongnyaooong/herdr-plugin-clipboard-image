@@ -10,65 +10,72 @@ import subprocess
 import sys
 import threading
 import time
-import ctypes
 import shutil
 import posixpath
 import shlex
-from ctypes import wintypes
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
-from PIL import ImageGrab
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+    from PIL import ImageGrab
 
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
 
-WH_KEYBOARD_LL = 13
-WM_KEYDOWN = 0x0100
-WM_SYSKEYDOWN = 0x0104
-VK_CONTROL = 0x11
-VK_MENU = 0x12
-VK_V = 0x56
-CF_BITMAP = 2
-CF_DIB = 8
-CF_HDROP = 15
-CF_DIBV5 = 17
-PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-LLKHF_UP = 0x80
+    WH_KEYBOARD_LL = 13
+    WM_KEYDOWN = 0x0100
+    WM_SYSKEYDOWN = 0x0104
+    VK_CONTROL = 0x11
+    VK_MENU = 0x12
+    VK_V = 0x56
+    CF_BITMAP = 2
+    CF_DIB = 8
+    CF_HDROP = 15
+    CF_DIBV5 = 17
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    LLKHF_UP = 0x80
 
-LRESULT = ctypes.c_ssize_t
-HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    LRESULT = ctypes.c_ssize_t
+    HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
 
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("vkCode", wintypes.DWORD),
+            ("scanCode", wintypes.DWORD),
+            ("flags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
 
-class KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("vkCode", wintypes.DWORD),
-        ("scanCode", wintypes.DWORD),
-        ("flags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_size_t),
+    user32.SetWindowsHookExW.restype = wintypes.HHOOK
+    user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+    user32.CallNextHookEx.restype = LRESULT
+    user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+    user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
     ]
 
-
-user32.SetWindowsHookExW.restype = wintypes.HHOOK
-user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
-user32.CallNextHookEx.restype = LRESULT
-user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
-user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
-user32.GetForegroundWindow.restype = wintypes.HWND
-user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-kernel32.OpenProcess.restype = wintypes.HANDLE
-kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-kernel32.QueryFullProcessImageNameW.argtypes = [
-    wintypes.HANDLE,
-    wintypes.DWORD,
-    wintypes.LPWSTR,
-    ctypes.POINTER(wintypes.DWORD),
-]
-
-STATE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.getcwd()), "herdr", "clipboard-image")
+if sys.platform == "win32":
+    STATE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.getcwd()), "herdr", "clipboard-image")
+else:
+    STATE_DIR = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"),
+        "herdr",
+        "plugins",
+        "clipboard-image",
+    )
 LOG_PATH = os.path.join(STATE_DIR, "paste.log")
 hook_handle = None
 hook_proc = None
@@ -124,7 +131,8 @@ def run_herdr(args, ignore_caller=False):
 
 
 def stage_dir():
-    path = os.path.join(os.environ.get("TEMP", STATE_DIR), "herdr-clipboard-images")
+    temp = os.environ.get("TEMP") or os.environ.get("TMPDIR") or STATE_DIR
+    path = os.path.join(temp, "herdr-clipboard-images")
     os.makedirs(path, exist_ok=True)
     cutoff = datetime.now() - timedelta(days=2)
     for name in os.listdir(path):
@@ -390,6 +398,13 @@ def paste_image(machine=None):
     if not path:
         log("clipboard has no image")
         return
+    deliver_saved_image(path, machine)
+
+
+def deliver_saved_image(path, machine=None):
+    if not path:
+        log("clipboard has no image")
+        return
     if machine:
         # The machine target is captured from the foreground window at the
         # Ctrl+V event. Keep using that target even if the foreground changes
@@ -582,6 +597,9 @@ def hook_callback(code, wparam, lparam):
 
 
 def main():
+    if sys.platform != "win32":
+        log("Windows paste watch is unavailable on this system")
+        return 1
     global hook_handle, hook_proc
     os.makedirs(STATE_DIR, exist_ok=True)
     refresh_workspace_label()

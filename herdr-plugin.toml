@@ -3,7 +3,7 @@ name = "Clipboard Image"
 version = "0.1.0"
 min_herdr_version = "0.9.0"
 description = "Pastes clipboard images or text into the focused Herdr pane."
-platforms = ["linux", "windows"]
+platforms = ["linux", "macos", "windows"]
 
 [[actions]]
 id = "paste"
@@ -17,6 +17,20 @@ title = "Paste Linux clipboard image"
 command = ["python3", "scripts/paste-linux.py"]
 platforms = ["linux"]
 
+[[actions]]
+id = "paste-macos"
+title = "Paste macOS clipboard"
+command = ["python3", "scripts/paste_macos.py"]
+platforms = ["macos"]
+
 [[startup]]
 command = ["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/paste-watch.ps1"]
 platforms = ["windows"]
+
+[[startup]]
+command = ["sh", "scripts/paste-watch-macos.sh"]
+platforms = ["macos"]
+
+[[build]]
+command = ["sh", "scripts/build-macos.sh"]
+platforms = ["macos"]
