@@ -463,7 +463,12 @@ def deliver_saved_image(path, machine=None):
     env = os.environ.copy()
     env.pop("HERDR_PANE_ID", None)
     env.pop("HERDR_TAB_ID", None)
-    args = ["pane", "send-text", pane_id, f" {shown} "]
+    text = f" {shown} "
+    if (pane.get("agent") or "").lower() == "claude":
+        # Claude Code attaches an image only when its path arrives as a
+        # bracketed paste (like a drag and drop); typed text stays a path.
+        text = f"\x1b[200~{shown}\x1b[201~"
+    args = ["pane", "send-text", pane_id, text]
     try:
         proc = subprocess.run(
             [herdr_bin(), *args],
